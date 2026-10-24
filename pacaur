@@ -1,0 +1,1250 @@
+#!/usr/bin/env bash
+
+program_name=${0##*/}
+
+usage() {
+    printf 'Usage: %s [-h]\n       %s -i PACKAGE\n       %s -s KEYWORDS\n       %s -d PACKAGE\n       %s -m DIRECTORY\n       %s -U FILE...\n       %s -S PACKAGE [--syncdeps]\n       %s -R PACKAGE...\n       %s --checkupdates\n       %s -u [--syncdeps]\n\n' \
+        "$program_name" "$program_name" "$program_name" "$program_name" "$program_name" "$program_name" "$program_name" "$program_name" "$program_name" "$program_name"
+    printf '%s\n' \
+        'Search AUR packages, download snapshots, build, install and remove packages.' \
+        '' \
+        'Options:' \
+        '  -h           Show this help message and exit.' \
+        '  -i PACKAGE   Show information for one exact AUR package name.' \
+        '  -s KEYWORDS  Search package names and descriptions (at least 2 characters).' \
+        '  -d PACKAGE   Download a verified build snapshot into the current directory.' \
+        '  -m DIRECTORY Build a local PKGBUILD with makepkg --log as a non-root user.' \
+        '  -U FILE...   Install one or more local package files using pacman -U.' \
+        '  -S PACKAGE   Download, review, build and install one exact AUR package.' \
+        '  --syncdeps   With -S or -u, install missing dependencies from configured repositories.' \
+        '  -R PACKAGE... Remove exact installed packages using pacman -R.' \
+        '  --checkupdates List newer AUR versions of installed foreign packages.' \
+        '  -u           Confirm and upgrade newer AUR packages by package base.' \
+        '' \
+        'Quote search strings containing spaces. Querying requires curl and jq.' \
+        'Downloading also requires tar, gzip and GNU coreutils; existing targets are preserved.' \
+        'Building requires makepkg, setsid and a reviewed local build directory.' \
+        'Installing/removing requires pacman, plus sudo for non-root users; pacman asks for confirmation.' \
+        'Checking updates uses pacman, curl, jq and vercmp; no elevation or installation.' \
+        '-S and -u run as a non-root user, also require mkdir and sed, and retain workspaces.' \
+        '-u also requires pacman-conf and respects IgnorePkg/IgnoreGroup.'
+}
+
+error() {
+    printf '%s: %s\n' "$program_name" "$*" >&2
+}
+
+argument_error() {
+    error "$1"
+    printf 'Try "%s -h" for help.\n' "$program_name" >&2
+    return 2
+}
+
+require_tools() {
+    local dependency
+
+    for dependency in "$@"; do
+        if ! command -v "$dependency" > /dev/null 2>&1; then
+            error "Required command not found: $dependency."
+            return 1
+        fi
+    done
+}
+
+request_aur() {
+    local request_type=$1 expected_type response results status parameter
+    shift
+    local -a data_arguments=(--data-urlencode 'v=5' --data-urlencode "type=$request_type")
+
+    expected_type=$request_type
+    if [[ $request_type == info ]]; then
+        expected_type=multiinfo
+    fi
+
+    for parameter in "$@"; do
+        data_arguments+=(--data-urlencode "$parameter")
+    done
+
+    if response=$(curl --disable --silent --show-error --fail \
+        --connect-timeout 5 --max-time 15 --get \
+        "${data_arguments[@]}" \
+        'https://aur.archlinux.org/rpc/'); then
+        :
+    else
+        status=$?
+        case $status in
+            28) error 'AUR request timed out.' ;;
+            22) error 'AUR request failed with an HTTP error.' ;;
+            *) error "AUR request failed (curl exit status $status)." ;;
+        esac
+        return 1
+    fi
+
+    # Accept one JSON object, including when the HTTP response is otherwise successful.
+    if ! response=$(jq -ces '
+        if length == 1 and (.[0] | type == "object") then .[0] else empty end
+    ' <<< "$response" 2> /dev/null); then
+        error 'AUR returned an invalid JSON response.'
+        return 1
+    fi
+
+    if ! results=$(jq -ce --arg expected_type "$expected_type" '
+        def fail($message): ($message + "\n") | halt_error(1);
+
+        if .version != 5 then
+            fail("Unexpected AUR response version.")
+        elif .type == "error" then
+            if (.error | type) == "string" and .error != "" then
+                fail("AUR API error: " + .error)
+            else
+                fail("AUR API error.")
+            end
+        elif .type != $expected_type
+            or (.results | type) != "array"
+            or (.resultcount | type) != "number"
+            or .resultcount != (.results | length) then
+            fail("Unexpected AUR response format.")
+        else
+            .results
+        end
+    ' <<< "$response" 2>&1); then
+        error "$results"
+        return 1
+    fi
+
+    printf '%s\n' "$results"
+}
+
+query_info() {
+    local package=$1 results info
+    require_tools curl jq || return 1
+
+    if ! results=$(request_aur info "arg[]=$package"); then
+        return 1
+    fi
+
+    if ! info=$(jq -er --arg package "$package" '
+        def fail($message): ($message + "\n") | halt_error(1);
+        def optional_string: . == null or type == "string";
+        def display: if . == null or . == "" then "(none)" else . end;
+
+        if length > 1 then
+            fail("Unexpected AUR response format.")
+        elif length == 0 then
+            fail("AUR package not found: " + $package)
+        else
+            .[0] |
+            if type != "object" then
+                fail("Unexpected AUR package data.")
+            elif .Name != $package
+                or (.Version | type) != "string" or .Version == ""
+                or ((.Description | optional_string) | not)
+                or ((.Maintainer | optional_string) | not) then
+                fail("Unexpected AUR package data.")
+            else
+                "Name        : \(.Name)\n" +
+                "Version     : \(.Version)\n" +
+                "Description : \(.Description | display)\n" +
+                "Maintainer  : \(.Maintainer | display)\n" +
+                "AUR URL     : https://aur.archlinux.org/packages/\(.Name | @uri)"
+            end
+        end
+    ' <<< "$results" 2>&1); then
+        error "$info"
+        return 1
+    fi
+
+    printf '%s\n' "$info"
+}
+
+query_search() {
+    local keywords=$1 results output
+    require_tools curl jq || return 1
+
+    # jq counts Unicode characters even when the shell is running in the C locale.
+    if ! jq -en --arg keywords "$keywords" '$keywords | length >= 2' > /dev/null; then
+        argument_error '-s requires one search string of at least 2 characters.'
+        return 2
+    fi
+
+    if ! results=$(request_aur search 'by=name-desc' "arg=$keywords"); then
+        return 1
+    fi
+
+    if ! output=$(jq -er '
+        def fail($message): ($message + "\n") | halt_error(1);
+        def optional_string: . == null or type == "string";
+        def display: if . == null or . == "" then "(none)" else . end;
+
+        if any(.[]; type != "object") then
+            fail("Unexpected AUR package data.")
+        elif any(.[];
+            (.Name | type) != "string" or .Name == ""
+            or (.Version | type) != "string" or .Version == ""
+            or ((.Description | optional_string) | not)) then
+            fail("Unexpected AUR package data.")
+        elif length == 0 then
+            "No matching packages found."
+        else
+            sort_by(.Name) |
+            map("aur/\(.Name) \(.Version)\n    \(.Description | display)") |
+            join("\n")
+        end
+    ' <<< "$results" 2>&1); then
+        error "$output"
+        return 1
+    fi
+
+    printf '%s\n' "$output"
+}
+
+query_update_batch() {
+    local package results metadata
+    local -a arguments=()
+    for package in "$@"; do
+        arguments+=("arg[]=$package")
+    done
+    results=$(request_aur info "${arguments[@]}") || return 1
+    if ! metadata=$(jq -erj '
+        def fail($message): ($message + "\n") | halt_error(1);
+        def valid_version:
+            if type == "string" then
+                test("\\A[!-~]+\\z") and (startswith("-") | not)
+            else false end;
+        def valid_base:
+            if type == "string" then test("\\A[a-z0-9][a-z0-9.+_-]*\\z") else false end;
+        $ARGS.positional as $requested |
+        if any(.[]; type != "object") then
+            fail("Unexpected AUR update data.")
+        elif any(.[]; (.Name | type) != "string" or (.Version | valid_version | not)
+            or (.PackageBase | valid_base | not)) then
+            fail("Unexpected AUR update data.")
+        elif length != (unique_by(.Name) | length) then
+            fail("AUR returned duplicate update package names.")
+        elif any(.[]; .Name as $name | ($requested | index($name)) == null) then
+            fail("AUR returned an unrequested update package name.")
+        else
+            map(.Name + "\t" + .Version + "\t" + .PackageBase) | join("\n")
+        end
+    ' --args "$@" <<< "$results" 2>&1); then
+        error "$metadata"
+        return 1
+    fi
+    printf '%s' "$metadata"
+}
+
+query_update_packages() {
+    local encoded package cost batch_size=0 metadata remote_info=''
+    local -a batch=()
+    if ! encoded=$(printf '%s\n' "$@" | jq -Rsrj '
+        split("\n") | .[:-1] |
+        map(. + "\t" + (((@uri | length) + 16) | tostring)) | join("\n")
+    '); then
+        error 'Unable to prepare update queries.'
+        return 1
+    fi
+    while IFS=$'\t' read -r package cost; do
+        if (( cost > 3500 )); then
+            error 'A package name is too long for an AUR update query.'
+            return 1
+        fi
+        if (( ${#batch[@]} >= 100 || batch_size + cost > 3500 )); then
+            metadata=$(query_update_batch "${batch[@]}") || return 1
+            [[ -z $metadata ]] || remote_info+="$metadata"$'\n'
+            batch=()
+            batch_size=0
+        fi
+        batch+=("$package")
+        ((batch_size += cost))
+    done <<< "$encoded"
+    metadata=$(query_update_batch "${batch[@]}") || return 1
+    [[ -z $metadata ]] || remote_info+="$metadata"$'\n'
+    printf '%s' "$remote_info"
+}
+
+collect_updates() {
+    local listing status line package version base sorted remote_info
+    local comparison
+    local LC_ALL=C
+    local record_pattern='^([a-zA-Z0-9@_+][a-zA-Z0-9@._+-]*) ([!-~]+)$'
+    local -a packages=() records=()
+    local -A installed_versions=() aur_versions=() aur_bases=()
+
+    require_tools pacman || return 1
+    # pacman returns 1 without output for no matches. Capture diagnostics as well
+    # so database/configuration failures cannot look like an empty candidate list.
+    if listing=$(pacman -Qm 2>&1); then
+        :
+    else
+        status=$?
+        if [[ $status != 1 || -n $listing ]]; then
+            [[ -z $listing ]] || printf '%s\n' "$listing" >&2
+            error "Foreign package query failed (pacman exit status $status)."
+            return 1
+        fi
+    fi
+    if [[ -z $listing ]]; then
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        if [[ ! $line =~ $record_pattern ]]; then
+            error 'Unexpected local package query output.'
+            return 1
+        fi
+        package=${BASH_REMATCH[1]}
+        version=${BASH_REMATCH[2]}
+        if [[ $version == -* || ${installed_versions[$package]+present} ]]; then
+            error 'Invalid or duplicate local package data.'
+            return 1
+        fi
+        installed_versions[$package]=$version
+        packages+=("$package")
+    done <<< "$listing"
+
+    require_tools curl jq vercmp || return 1
+    if ! sorted=$(printf '%s\n' "${packages[@]}" | jq -Rsrj '
+        split("\n") | .[:-1] | sort | join("\n")
+    '); then
+        error 'Unable to prepare update queries.'
+        return 1
+    fi
+    mapfile -t packages <<< "$sorted"
+    remote_info=$(query_update_packages "${packages[@]}") || return 1
+
+    if [[ -n $remote_info ]]; then
+        while IFS=$'\t' read -r package version base; do
+            aur_versions[$package]=$version
+            aur_bases[$package]=$base
+        done <<< "$remote_info"
+    fi
+    for package in "${packages[@]}"; do
+        if [[ ! ${aur_versions[$package]+present} ]]; then
+            records+=("missing"$'\t'"$package"$'\t'"${installed_versions[$package]}")
+            continue
+        fi
+        if comparison=$(vercmp "${installed_versions[$package]}" "${aur_versions[$package]}"); then
+            :
+        else
+            status=$?
+            error "Version comparison failed for $package (vercmp exit status $status)."
+            return 1
+        fi
+        if [[ ! $comparison =~ ^-?[0-9]+$ ]]; then
+            error "Unexpected vercmp output for $package."
+            return 1
+        fi
+        if [[ $comparison == -* && $comparison == *[1-9]* ]]; then
+            records+=("update"$'\t'"$package"$'\t'"${installed_versions[$package]}"$'\t'"${aur_versions[$package]}"$'\t'"${aur_bases[$package]}")
+        else
+            records+=("current"$'\t'"$package"$'\t'"${installed_versions[$package]}"$'\t'"${aur_versions[$package]}"$'\t'"${aur_bases[$package]}")
+        fi
+    done
+
+    # TSV fields contain no tabs/newlines; callers format these internal records.
+    printf '%s\n' "${records[@]}"
+}
+
+check_updates() {
+    local data kind package installed available base matched=0
+    local -a updates=()
+    data=$(collect_updates) || return 1
+    if [[ -z $data ]]; then
+        printf 'No foreign packages installed.\n'
+        return 0
+    fi
+    while IFS=$'\t' read -r kind package installed available base; do
+        case $kind in
+            missing) error "Not found in AUR: $package" ;;
+            current) ((matched += 1)) ;;
+            update)
+                ((matched += 1))
+                updates+=("$package $installed -> $available")
+                ;;
+        esac
+    done <<< "$data"
+    if (( ${#updates[@]} )); then
+        printf '%s\n' "${updates[@]}"
+    elif (( matched )); then
+        printf 'No newer AUR versions found for matched packages.\n'
+    else
+        printf 'No installed foreign packages were found in AUR.\n'
+    fi
+    return 0
+}
+
+download_snapshot() {
+    local package=$1 results metadata package_base snapshot_path directory destination
+    local expected_base=${2:-}
+    local temporary_file='' recipe_entry status
+    require_tools curl jq tar gzip mktemp ln rm || return 1
+
+    if ! results=$(request_aur info "arg[]=$package"); then
+        return 1
+    fi
+
+    if ! metadata=$(jq -erj --arg package "$package" '
+        def fail($message): ($message + "\n") | halt_error(1);
+        if length == 0 then
+            fail("AUR package not found: " + $package)
+        elif length != 1 then
+            fail("Unexpected AUR response format.")
+        else
+            .[0] |
+            if type != "object" then
+                fail("Unexpected AUR download data.")
+            elif .Name != $package or (.PackageBase | type) != "string" then
+                fail("Unexpected AUR download data.")
+            elif (.PackageBase | test("\\A[a-z0-9][a-z0-9.+_-]*\\z") | not)
+                or .URLPath != ("/cgit/aur.git/snapshot/" + .PackageBase + ".tar.gz") then
+                fail("Unexpected AUR download data.")
+            else
+                [.PackageBase, .URLPath] | @tsv
+            end
+        end
+    ' <<< "$results" 2>&1); then
+        error "$metadata"
+        return 1
+    fi
+    IFS=$'\t' read -r package_base snapshot_path <<< "$metadata"
+    if [[ -n $expected_base && $package_base != "$expected_base" ]]; then
+        error "Package base changed for $package; run the update check again."
+        return 1
+    fi
+
+    if ! directory=$(pwd -P); then
+        error 'Unable to resolve the current directory.'
+        return 1
+    fi
+    destination="$directory/$package_base.tar.gz"
+    if [[ -e $destination || -L $destination ]]; then
+        error "Target already exists: $destination"
+        return 1
+    fi
+
+    # Exit while the local temporary path is still in scope for the cleanup trap.
+    trap 'if [[ -n $temporary_file ]]; then rm -f -- "$temporary_file"; fi' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if ! temporary_file=$(mktemp -- "$directory/.$package_base.tar.gz.part.XXXXXXXX"); then
+        error "Unable to create a temporary archive in: $directory"
+        exit 1
+    fi
+
+    if curl --disable --silent --show-error --fail \
+        --connect-timeout 5 --max-time 60 \
+        --output "$temporary_file" "https://aur.archlinux.org$snapshot_path"; then
+        :
+    else
+        status=$?
+        case $status in
+            28) error 'Snapshot download timed out.' ;;
+            22) error 'Snapshot download failed with an HTTP error.' ;;
+            *) error "Snapshot download failed (curl exit status $status)." ;;
+        esac
+        exit 1
+    fi
+
+    if ! GZIP= gzip --test -- "$temporary_file" > /dev/null 2>&1; then
+        error 'Snapshot is not a valid gzip archive.'
+        exit 1
+    fi
+    if ! recipe_entry=$(LC_ALL=C TAR_OPTIONS= GZIP= tar --list --verbose --gzip \
+        --file "$temporary_file" -- "$package_base/PKGBUILD" 2> /dev/null); then
+        error "Snapshot is not a readable tar archive containing $package_base/PKGBUILD."
+        exit 1
+    fi
+    if [[ $recipe_entry != -*" $package_base/PKGBUILD" || $recipe_entry == *$'\n'* ]]; then
+        error "Snapshot must contain one regular $package_base/PKGBUILD file."
+        exit 1
+    fi
+
+    # A hard link publishes the complete file without replacing a concurrent target.
+    if ! ln -T -- "$temporary_file" "$destination"; then
+        error "Unable to save archive without overwriting: $destination"
+        exit 1
+    fi
+    if ! rm -f -- "$temporary_file"; then
+        error "Archive saved, but unable to remove temporary file: $temporary_file"
+        exit 1
+    fi
+    temporary_file=''
+    printf '%s\n' "$destination"
+    exit 0
+}
+
+build_package() {
+    local directory=$1 syncdeps=${2:-0}
+    local -a arguments=(--log)
+
+    if [[ ! -d $directory ]]; then
+        error "Build directory does not exist: $directory"
+        return 1
+    fi
+    if [[ ! -f $directory/PKGBUILD || ! -r $directory/PKGBUILD ]]; then
+        error "Build directory must contain a readable PKGBUILD: $directory"
+        return 1
+    fi
+    if (( EUID == 0 )); then
+        error 'Cannot build packages as root. Run -m as a non-root user.'
+        return 1
+    fi
+    require_tools makepkg setsid || return 1
+    if ! cd -- "$directory"; then
+        error "Unable to enter build directory: $directory"
+        return 1
+    fi
+
+    if (( syncdeps )); then
+        arguments+=(--syncdeps)
+    fi
+    run_makepkg "${arguments[@]}"
+}
+
+run_makepkg() {
+    local status=0 build_pid running_pid build_signal='' argument syncdeps=0
+    for argument in "$@"; do
+        [[ $argument == --syncdeps ]] && syncdeps=1
+    done
+
+    if (( syncdeps )); then
+        # sudo needs the controlling terminal. Keep makepkg in its foreground group
+        # so authentication, pacman prompts and terminal interrupts work normally.
+        makepkg "$@" || status=$?
+    else
+        # Record cancellation even if it arrives before the child PID is assigned.
+        trap 'build_signal=HUP' HUP
+        trap 'build_signal=INT' INT
+        trap 'build_signal=TERM' TERM
+
+        # Keep the launcher PID as the process-group ID; preserve stdin for makepkg.
+        set +m
+        (trap - HUP INT TERM; exec setsid -- makepkg "$@") <&0 &
+        build_pid=$!
+        if [[ -z $build_signal ]]; then
+            if wait "$build_pid"; then
+                status=0
+            else
+                status=$?
+            fi
+        fi
+
+        if [[ -n $build_signal ]]; then
+            trap '' HUP INT TERM
+            # Stop the entire build group, including foreground compiler processes.
+            for running_pid in $(jobs -p); do
+                if [[ $running_pid == "$build_pid" ]]; then
+                    kill -TERM -- "-$build_pid" 2> /dev/null \
+                        || kill -TERM "$build_pid" 2> /dev/null || true
+                fi
+            done
+            wait "$build_pid" 2> /dev/null || true
+            case $build_signal in
+                HUP) status=129 ;;
+                INT) status=130 ;;
+                TERM) status=143 ;;
+            esac
+        fi
+        trap - HUP INT TERM
+    fi
+
+    case $status in
+        0) return 0 ;;
+        129|130|143)
+            error "Build interrupted (exit status $status)."
+            return "$status"
+            ;;
+        *)
+            error "makepkg failed (exit status $status)."
+            return 1
+            ;;
+    esac
+}
+
+install_packages() {
+    local package directory status
+    local -a packages=() install_command=(pacman)
+
+    if ! directory=$(pwd -P); then
+        error 'Unable to resolve the current directory.'
+        return 1
+    fi
+    for package in "$@"; do
+        if [[ ! -f $package || ! -r $package ]]; then
+            error "Package must be a readable local file: $package"
+            return 1
+        fi
+        # Absolute paths stay local and usable even if sudo changes directories.
+        if [[ $package != /* ]]; then
+            package="$directory/$package"
+        fi
+        packages+=("$package")
+    done
+
+    require_tools pacman || return 1
+    if (( EUID != 0 )); then
+        require_tools sudo || return 1
+        install_command=(sudo -- pacman)
+    fi
+
+    # Parse every package before requesting installation privileges.
+    if pacman -Qp -- "${packages[@]}" > /dev/null; then
+        :
+    else
+        status=$?
+        error "Package validation failed (pacman exit status $status)."
+        case $status in
+            129|130|143) return "$status" ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    # Keep the foreground terminal, prompts and default pacman checks intact.
+    if "${install_command[@]}" -U -- "${packages[@]}"; then
+        return 0
+    else
+        status=$?
+        case $status in
+            129|130|143)
+                error "Package installation interrupted (exit status $status)."
+                return "$status"
+                ;;
+            *)
+                error "Package installation failed (exit status $status)."
+                return 1
+                ;;
+        esac
+    fi
+}
+
+package_version() {
+    local package=$1 metadata=$2 version LC_ALL=C
+    if [[ $metadata != "$package "* || $metadata == *$'\n'* ]]; then
+        error "Package metadata does not match the exact target: $package"
+        return 1
+    fi
+    version=${metadata#"$package "}
+    if [[ ! $version =~ ^[!-~]+$ || $version == -* ]]; then
+        error "Invalid package version for $package."
+        return 1
+    fi
+    printf '%s' "$version"
+}
+
+installed_package_state() {
+    local package=$1 metadata version reason status
+    if metadata=$(pacman -Q -- "$package"); then
+        version=$(package_version "$package" "$metadata") || return 1
+    else
+        status=$?
+        error "Unable to query installed target $package (pacman exit status $status)."
+        case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+    fi
+    if metadata=$(pacman -Qeq -- "$package" 2>&1); then
+        [[ $metadata == "$package" ]] || { error "Unexpected installation reason for $package."; return 1; }
+        reason=explicit
+    else
+        status=$?
+        if [[ $status != 1 || -n $metadata ]]; then
+            [[ -z $metadata ]] || printf '%s\n' "$metadata" >&2
+            error "Unable to query installation reason for $package (pacman exit status $status)."
+            case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+        fi
+        if metadata=$(pacman -Qdq -- "$package"); then
+            [[ $metadata == "$package" ]] || { error "Unexpected installation reason for $package."; return 1; }
+            reason=dependency
+        else
+            status=$?
+            error "Unable to query installation reason for $package (pacman exit status $status)."
+            case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+        fi
+    fi
+    printf '%s\t%s' "$version" "$reason"
+}
+
+install_upgrade_group() {
+    local package path expected_version expected_reason metadata version state comparison status index
+    local -a packages=() paths=() before=() after=()
+    # Each internal tuple is: exact name, artifact path, installed version, reason.
+    while (( $# )); do
+        package=$1 path=$2 expected_version=$3 expected_reason=$4
+        shift 4
+        if metadata=$(pacman -Qp -- "$path"); then
+            version=$(package_version "$package" "$metadata") || return 1
+        else
+            status=$?
+            error "Unable to inspect upgrade artifact (pacman exit status $status)."
+            case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+        fi
+        if comparison=$(vercmp "$expected_version" "$version"); then
+            :
+        else
+            status=$?
+            error "Upgrade version comparison failed (vercmp exit status $status)."
+            case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+        fi
+        if [[ ! $comparison =~ ^-?[0-9]+$ ]]; then
+            error "Unexpected vercmp output for $package."
+            return 1
+        fi
+        if [[ $comparison != -* || $comparison != *[1-9]* ]]; then
+            error "Built package is not newer than the installed version: $package"
+            return 1
+        fi
+        packages+=("$package")
+        paths+=("$path")
+        before+=("$expected_version"$'\t'"$expected_reason")
+        after+=("$version"$'\t'"$expected_reason")
+    done
+    # All members must pass validation before submitting the one transaction.
+    for index in "${!packages[@]}"; do
+        package=${packages[index]}
+        state=$(installed_package_state "$package") || return $?
+        if [[ $state != "${before[index]}" ]]; then
+            error "Installed state changed for $package; run the update check again."
+            return 1
+        fi
+    done
+    # pacman preserves each existing package's reason without --asdeps/--asexplicit.
+    install_packages "${paths[@]}" || return $?
+    for index in "${!packages[@]}"; do
+        package=${packages[index]}
+        state=$(installed_package_state "$package") || return $?
+        if [[ $state != "${after[index]}" ]]; then
+            error "Upgrade could not be verified for $package; check member versions and reasons."
+            return 1
+        fi
+    done
+}
+
+remove_packages() {
+    local status installed_names expected_names
+    local -a remove_command=(pacman)
+
+    require_tools pacman || return 1
+
+    # Queries can resolve provider aliases; check the returned names before elevation.
+    if installed_names=$(pacman -Qq -- "$@"); then
+        :
+    else
+        status=$?
+        error "Installed package validation failed (pacman exit status $status)."
+        case $status in
+            129|130|143) return "$status" ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf -v expected_names '%s\n' "$@"
+    if [[ $installed_names != "${expected_names%$'\n'}" ]]; then
+        error 'Removal requires exact installed package names; provider aliases are not accepted.'
+        return 1
+    fi
+
+    if (( EUID != 0 )); then
+        require_tools sudo || return 1
+        remove_command=(sudo -- pacman)
+    fi
+
+    # Submit all targets together; let pacman check dependencies and confirm.
+    if "${remove_command[@]}" -R -- "$@"; then
+        return 0
+    else
+        status=$?
+        case $status in
+            129|130|143)
+                error "Package removal interrupted (exit status $status)."
+                return "$status"
+                ;;
+            *)
+                error "Package removal failed (exit status $status)."
+                return 1
+                ;;
+        esac
+    fi
+}
+
+extract_snapshot() {
+    local archive=$1 base=$2 destination=$3 listing line mode path type
+    local LC_ALL=C
+    local safe_path='^[a-zA-Z0-9._+@,=:/ -]+$'
+    local entry_format='^([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]](.*)$'
+    local -A seen=()
+    local -a files=()
+
+    # List original names with escaped control characters before extracting anything.
+    if ! listing=$(LC_ALL=C TZ=UTC TAR_OPTIONS= GZIP= tar --list --verbose \
+        --numeric-owner --full-time --quoting-style=escape --absolute-names \
+        --gzip --file "$archive"); then
+        error 'Unable to inspect snapshot entries.'
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ ! $line =~ $entry_format ]]; then
+            error 'Unexpected snapshot entry format.'
+            return 1
+        fi
+        mode=${BASH_REMATCH[1]}
+        path=${BASH_REMATCH[2]}
+        type=${mode:0:1}
+        if [[ $type != - && $type != d ]] || [[ ! $path =~ $safe_path ]]; then
+            error 'Snapshot contains an unsupported file type or path.'
+            return 1
+        fi
+        if [[ $type == d ]]; then
+            path=${path%/}
+        elif [[ $path == */ ]]; then
+            error 'Snapshot contains a file with a directory path.'
+            return 1
+        fi
+        if [[ $path != "$base/"* && ! ( $path == "$base" && $type == d ) ]]; then
+            error 'Snapshot entry is outside its package base.'
+            return 1
+        fi
+        case "/$path/" in
+            *'/../'*|*'/./'*|*'//'*)
+                error 'Snapshot contains a non-canonical path.'
+                return 1
+                ;;
+        esac
+        if [[ ${seen[$path]+present} ]]; then
+            error 'Snapshot contains duplicate paths.'
+            return 1
+        fi
+        seen[$path]=1
+        if [[ $type == - ]]; then
+            files+=("$path")
+        fi
+    done <<< "$listing"
+
+    if ! TAR_OPTIONS= GZIP= tar --extract --gzip --file "$archive" \
+        --directory "$destination" --no-same-owner --no-same-permissions \
+        --keep-old-files; then
+        error 'Unable to extract the snapshot.'
+        return 1
+    fi
+    printf '%s\n' "${files[@]}"
+}
+
+sync_package() (
+    local package=$1 syncdeps=${2:-0} parent workspace archive base files path answer package_list name status
+    local upgrade_base=${3:-} record version reason metadata actual_base review_label=$1
+    local -a upgrade_records=("${@:4}") requested=("$1") upgrade_arguments=()
+    local -A wanted=() selected=() seen=()
+
+    if (( EUID == 0 )); then
+        error 'Cannot run -S as root. Use a non-root user; installation will use sudo.'
+        return 1
+    fi
+    require_tools curl jq tar gzip mktemp ln rm mkdir sed makepkg setsid pacman sudo || return 1
+    if [[ -n $upgrade_base ]]; then
+        requested=()
+        for record in "${upgrade_records[@]}"; do
+            IFS=$'\t' read -r name version reason <<< "$record"
+            requested+=("$name")
+        done
+        # Recheck every member, including groups spanning multiple RPC batches.
+        metadata=$(query_update_packages "${requested[@]}") || return 1
+        if [[ -n $metadata ]]; then
+            while IFS=$'\t' read -r name version actual_base; do
+                if [[ $actual_base != "$upgrade_base" ]]; then
+                    error "Package base changed for $name; run the update check again."
+                    return 1
+                fi
+                seen[$name]=1
+            done <<< "$metadata"
+        fi
+        for name in "${requested[@]}"; do
+            if [[ ! ${seen[$name]+present} ]]; then
+                error "AUR update target disappeared: $name"
+                return 1
+            fi
+        done
+        review_label="$upgrade_base [${requested[*]}]"
+    fi
+    for name in "${requested[@]}"; do wanted[$name]=1; done
+    if ! parent=$(cd -- "${TMPDIR:-/tmp}" && pwd -P); then
+        error 'Unable to access the temporary directory.'
+        return 1
+    fi
+    export TMPDIR="$parent"
+    umask 077
+    if ! workspace=$(mktemp -d -- "$parent/pacaur-build.XXXXXXXX"); then
+        error 'Unable to create a build workspace.'
+        return 1
+    fi
+    printf 'Workspace (retained): %s\n' "$workspace"
+
+    # download_snapshot owns its exit/cleanup traps inside this subshell.
+    if archive=$(cd -- "$workspace" && download_snapshot "$package" "$upgrade_base"); then
+        :
+    else
+        return $?
+    fi
+    base=${archive##*/}
+    base=${base%.tar.gz}
+    if ! mkdir -- "$workspace/source"; then
+        error 'Unable to create the snapshot extraction directory.'
+        return 1
+    fi
+    if files=$(extract_snapshot "$archive" "$base" "$workspace/source"); then
+        :
+    else
+        return $?
+    fi
+
+    # Show all snapshot files as escaped text, without executing any build script.
+    while IFS= read -r path; do
+        printf '\nReview (escaped text): %s\n' "$path"
+        if ! LC_ALL=C sed -n 'l' -- "$workspace/source/$path"; then
+            error "Unable to review snapshot file: $path"
+            return 1
+        fi
+    done <<< "$files"
+    if (( syncdeps )); then
+        printf '\nBuild %s and install missing repository dependencies if needed? [y/N] ' "$review_label" >&2
+    else
+        printf '\nBuild the reviewed files for %s? [y/N] ' "$review_label" >&2
+    fi
+    if ! read -r answer || [[ ${answer,,} != y && ${answer,,} != yes ]]; then
+        error 'Build cancelled.'
+        return 1
+    fi
+
+    build_package "$workspace/source/$base" "$syncdeps" || return $?
+    if package_list=$(run_makepkg --packagelist); then
+        :
+    else
+        return $?
+    fi
+    if [[ -z $package_list ]]; then
+        error 'makepkg returned an empty package list.'
+        return 1
+    fi
+    if ! printf '%s\n' "$package_list" > "$workspace/packages.txt"; then
+        error 'Unable to record the built package list.'
+        return 1
+    fi
+    while IFS= read -r path; do
+        if [[ ! -f $path || ! -r $path ]]; then
+            error "Listed package must be a readable file: $path"
+            return 1
+        fi
+        if name=$(pacman -Qpq -- "$path"); then
+            :
+        else
+            status=$?
+            error "Unable to identify built package (pacman exit status $status)."
+            case $status in 129|130|143) return "$status" ;; *) return 1 ;; esac
+        fi
+        if [[ -n $name && ${wanted[$name]+present} ]]; then
+            if [[ ${selected[$name]+present} ]]; then
+                error "Multiple built packages match the target: $name"
+                return 1
+            fi
+            selected[$name]=$path
+        fi
+    done <<< "$package_list"
+    for name in "${requested[@]}"; do
+        if [[ ! ${selected[$name]+present} ]]; then
+            error "No built package matches the target: $name"
+            return 1
+        fi
+    done
+    if [[ -n $upgrade_base ]]; then
+        for record in "${upgrade_records[@]}"; do
+            IFS=$'\t' read -r name version reason <<< "$record"
+            upgrade_arguments+=("$name" "${selected[$name]}" "$version" "$reason")
+        done
+        install_upgrade_group "${upgrade_arguments[@]}"
+    else
+        install_packages "${selected[$package]}"
+    fi
+)
+
+matches_ignore() {
+    local value=$1 patterns=$2 pattern
+    while IFS= read -r pattern; do
+        [[ -n $pattern ]] || continue
+        case $value in $pattern) return 0 ;; esac
+    done <<< "$patterns"
+    return 1
+}
+
+upgrade_summary() {
+    local completed=$1 stopped=$2 index
+    shift 2
+    local -a targets=("$@")
+    printf '\nUpgrade summary (package bases):\n  Completed:'
+    if (( completed )); then printf ' %s' "${targets[@]:0:completed}"; else printf ' (none)'; fi
+    printf '\n'
+    index=$completed
+    if [[ -n $stopped ]]; then
+        printf '  Stopped at: %s (check member states)\n' "$stopped"
+        ((index += 1))
+    fi
+    printf '  Not processed:'
+    if (( index < ${#targets[@]} )); then printf ' %s' "${targets[@]:index}"; else printf ' (none)'; fi
+    printf '\n'
+}
+
+upgrade_packages() (
+    local syncdeps=$1 data kind package installed available base ignore_packages ignore_groups groups line group
+    local status answer state reason sorted label completed=0 stopped='' LC_ALL=C
+    local group_record='^([[:print:]]+) ([a-zA-Z0-9@_+][a-zA-Z0-9@._+-]*)$'
+    local -a candidates=() bases=() targets=() labels=() members=() states=()
+    local -A old_versions=() new_versions=() ignored_by_group=() package_bases=() base_members=() ignored_bases=()
+    # Match the ordinary shell globs accepted by pacman, without extended globs.
+    shopt -u extglob nocasematch
+    if (( EUID == 0 )); then
+        error 'Cannot run -u as root. Use a non-root user; installation will use sudo.'
+        return 1
+    fi
+    data=$(collect_updates) || return 1
+    if [[ -n $data ]]; then
+        while IFS=$'\t' read -r kind package installed available base; do
+            case $kind in
+                missing) error "Not found in AUR: $package" ;;
+                update)
+                    candidates+=("$package")
+                    old_versions[$package]=$installed
+                    new_versions[$package]=$available
+                    package_bases[$package]=$base
+                    base_members[$base]+="$package"$'\n'
+                    ;;
+            esac
+        done <<< "$data"
+    fi
+    if (( ! ${#candidates[@]} )); then
+        printf 'No AUR upgrades available.\n'
+        return 0
+    fi
+    require_tools pacman-conf || return 1
+    if ! ignore_packages=$(pacman-conf IgnorePkg) || ! ignore_groups=$(pacman-conf IgnoreGroup); then
+        error 'Unable to read pacman ignore rules.'
+        return 1
+    fi
+    if [[ -n $ignore_groups ]]; then
+        if groups=$(pacman -Qg 2>&1); then
+            :
+        else
+            status=$?
+            if [[ $status != 1 || -n $groups ]]; then
+                [[ -z $groups ]] || printf '%s\n' "$groups" >&2
+                error "Unable to query installed groups (pacman exit status $status)."
+                return 1
+            fi
+        fi
+        if [[ -n $groups ]]; then
+            while IFS= read -r line; do
+                if [[ ! $line =~ $group_record ]]; then
+                    error 'Unexpected installed group data.'
+                    return 1
+                fi
+                group=${BASH_REMATCH[1]}
+                package=${BASH_REMATCH[2]}
+                if matches_ignore "$group" "$ignore_groups"; then
+                    ignored_by_group[$package]=$group
+                fi
+            done <<< "$groups"
+        fi
+    fi
+    for package in "${candidates[@]}"; do
+        base=${package_bases[$package]}
+        if matches_ignore "$package" "$ignore_packages"; then
+            ignored_bases[$base]+="$package (IgnorePkg); "
+        elif [[ ${ignored_by_group[$package]+present} ]]; then
+            ignored_bases[$base]+="$package (IgnoreGroup: ${ignored_by_group[$package]}); "
+        fi
+    done
+    if ! sorted=$(printf '%s\n' "${!base_members[@]}" | jq -Rsrj 'split("\n") | .[:-1] | sort | join("\n")'); then
+        error 'Unable to group AUR upgrades.'
+        return 1
+    fi
+    mapfile -t bases <<< "$sorted"
+    for base in "${bases[@]}"; do
+        mapfile -t members <<< "${base_members[$base]%$'\n'}"
+        label="$base [${members[*]}]"
+        if [[ ${ignored_bases[$base]+present} ]]; then
+            printf 'Skipped package base: %s (ignored update members: %s)\n' "$label" "${ignored_bases[$base]%; }"
+        else
+            targets+=("$base")
+            labels+=("$label")
+        fi
+    done
+    if (( ! ${#targets[@]} )); then
+        printf 'No AUR upgrades remain after applying ignore rules.\n'
+        return 0
+    fi
+    require_tools tar gzip mktemp ln rm mkdir sed makepkg setsid sudo || return 1
+    printf 'AUR upgrade plan (one transaction per package base):\n'
+    for base in "${targets[@]}"; do
+        printf '  %s:\n' "$base"
+        mapfile -t members <<< "${base_members[$base]%$'\n'}"
+        for package in "${members[@]}"; do
+            printf '    %s %s -> %s\n' "$package" "${old_versions[$package]}" "${new_versions[$package]}"
+        done
+    done
+    # Explicit exits below keep the local progress state in scope for the EXIT trap.
+    trap 'upgrade_summary "$completed" "$stopped" "${labels[@]}"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '\nProceed with these AUR upgrades? [y/N] ' >&2
+    if ! read -r answer || [[ ${answer,,} != y && ${answer,,} != yes ]]; then
+        error 'Upgrade cancelled.'
+        exit 1
+    fi
+    for base in "${targets[@]}"; do
+        mapfile -t members <<< "${base_members[$base]%$'\n'}"
+        stopped="$base [${members[*]}]"
+        states=()
+        for package in "${members[@]}"; do
+            state=$(installed_package_state "$package") || exit $?
+            IFS=$'\t' read -r installed reason <<< "$state"
+            if [[ $installed != "${old_versions[$package]}" ]]; then
+                error "Installed version changed for $package; run the update check again."
+                exit 1
+            fi
+            states+=("$package"$'\t'"$installed"$'\t'"$reason")
+        done
+        printf '\nUpgrading package base %s...\n' "$stopped"
+        sync_package "${members[0]}" "$syncdeps" "$base" "${states[@]}" || exit $?
+        ((completed += 1))
+        stopped=''
+    done
+    exit 0
+)
+
+if (( $# == 0 )); then
+    usage
+    exit 0
+fi
+
+if (( $# == 1 )) && [[ $1 == '-h' ]]; then
+    usage
+    exit 0
+fi
+
+if [[ $1 == '-u' ]]; then
+    shift
+    if (( $# > 1 )) || { (( $# == 1 )) && [[ $1 != --syncdeps ]]; }; then
+        argument_error '-u accepts only one optional --syncdeps flag.'
+        exit 2
+    fi
+    upgrade_packages "$#"
+    exit $?
+fi
+
+if [[ $1 == '--checkupdates' ]]; then
+    if (( $# != 1 )); then
+        argument_error '--checkupdates accepts no additional arguments.'
+        exit 2
+    fi
+    check_updates
+    exit $?
+fi
+
+if [[ $1 == '-i' ]]; then
+    if (( $# != 2 )) || [[ -z $2 || $2 == -* ]]; then
+        argument_error '-i requires exactly one package name.'
+        exit 2
+    fi
+
+    query_info "$2"
+    exit $?
+fi
+
+if [[ $1 == '-s' ]]; then
+    if (( $# != 2 )) || [[ ${#2} -lt 2 || $2 == -* || $2 != *[![:space:]]* ]]; then
+        argument_error '-s requires one search string of at least 2 characters.'
+        exit 2
+    fi
+
+    query_search "$2"
+    exit $?
+fi
+
+if [[ $1 == '-d' ]]; then
+    if (( $# != 2 )) || [[ -z $2 || $2 == -* ]]; then
+        argument_error '-d requires exactly one package name.'
+        exit 2
+    fi
+
+    download_snapshot "$2"
+    exit $?
+fi
+
+if [[ $1 == '-m' ]]; then
+    if (( $# != 2 )) || [[ -z $2 || $2 == -* ]]; then
+        argument_error '-m requires exactly one build directory.'
+        exit 2
+    fi
+
+    build_package "$2"
+    exit $?
+fi
+
+if [[ $1 == '-U' ]]; then
+    shift
+    if (( $# == 0 )); then
+        argument_error '-U requires at least one local package file.'
+        exit 2
+    fi
+    for package in "$@"; do
+        if [[ -z $package || $package == -* ]]; then
+            argument_error '-U requires local package paths, not empty arguments or options.'
+            exit 2
+        fi
+    done
+
+    install_packages "$@"
+    exit $?
+fi
+
+if [[ $1 == '-R' ]]; then
+    shift
+    if (( $# == 0 )); then
+        argument_error '-R requires at least one installed package name.'
+        exit 2
+    fi
+    for package in "$@"; do
+        # Arch package names cannot contain paths, whitespace or leading dots/dashes.
+        if [[ ! $package =~ ^[a-zA-Z0-9@_+][a-zA-Z0-9@._+-]*$ ]]; then
+            argument_error '-R requires exact package names (letters, digits and @._+-), not paths or options.'
+            exit 2
+        fi
+    done
+
+    remove_packages "$@"
+    exit $?
+fi
+
+if [[ $1 == '-S' ]]; then
+    shift
+    package=''
+    syncdeps=0
+    for argument in "$@"; do
+        if [[ $argument == --syncdeps ]] && (( ! syncdeps )); then
+            syncdeps=1
+        elif [[ -n $argument && $argument != -* && -z $package ]]; then
+            package=$argument
+        else
+            argument_error '-S requires exactly one AUR package name and at most one --syncdeps option.'
+            exit 2
+        fi
+    done
+    if [[ -z $package ]]; then
+        argument_error '-S requires exactly one AUR package name and at most one --syncdeps option.'
+        exit 2
+    fi
+
+    sync_package "$package" "$syncdeps"
+    exit $?
+fi
+
+printf '%s: unsupported arguments:' "$program_name" >&2
+printf ' %q' "$@" >&2
+printf '\nTry "%s -h" for help.\n' "$program_name" >&2
+exit 2
