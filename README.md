@@ -425,7 +425,7 @@ Contact [@donaldturinglee](https://github.com/donaldturinglee) on GitHub. For pr
 
 ## License
 
-This repository does not currently include a license file.
+Distributed under the MIT License. See [LICENSE](LICENSE) for the terms.
 
 [Back to top](#readme-top)
 
@@ -437,5 +437,5 @@ This repository does not currently include a license file.
 [stars-url]: https://github.com/donaldturinglee/pacaur/stargazers
 [issues-shield]: https://img.shields.io/github/issues/donaldturinglee/pacaur.svg?style=for-the-badge
 [issues-url]: https://github.com/donaldturinglee/pacaur/issues
-[license-shield]: https://img.shields.io/badge/license-not_specified-lightgrey.svg?style=for-the-badge
-[license-url]: #license
+[license-shield]: https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge
+[license-url]: LICENSE
